@@ -1,4 +1,4 @@
-# main.py  -- converted to webhook (FastAPI) while preserving your handlers & logic
+# main.py  -- FastAPI + Webhook version WITH APPROVE SYSTEM INTEGRATED
 import os
 import asyncio
 import logging
@@ -24,10 +24,10 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# load env
+# ---------- LOAD ENV ----------
 load_dotenv()
 
-# local modules & helpers
+# ---------- IMPORT CONFIG ----------
 from config import (
     BOT_TOKEN,
     OWNER_ID,
@@ -39,6 +39,8 @@ from config import (
     LOGGER_CHAT_ID,
     validate_config,
 )
+
+# ---------- MODELS & DB ----------
 from models import (
     add_group,
     add_user,
@@ -52,62 +54,65 @@ from models import (
     ensure_indexes,
 )
 from db import ensure_connection, close as close_db
-# Use the blocking moderation functions here (we will call them in executor)
-from moderation import moderate_message_sync as moderate_message, evaluate_appeal_sync as evaluate_appeal
 
-# admin bypass (cached)
+# ---------- MODERATION (blocking helpers used in executor) ----------
+from moderation import (
+    moderate_message_sync as moderate_message,
+    evaluate_appeal_sync as evaluate_appeal,
+)
+
+# ---------- ADMIN BYPASS ----------
 from admin_bypass import is_admin_cached as is_admin
 
-# auto delete helper (we still use send_temp_message; job-based auto-delete available)
-import auto_delete
-
-# enqueue helper exists but not required here
+# ---------- APPROVALS ----------
+# approvals.py must provide: approve_cmd, unapprove_cmd, unapprove_all_cmd, should_moderate
 try:
-    from enqueue_helpers import enqueue_task
+    from approvals import approve_cmd, unapprove_cmd, unapprove_all_cmd, should_moderate
 except Exception:
-    enqueue_task = None
+    # safe fallbacks (so main.py won't crash if approvals.py missing)
+    def approve_cmd(update, context):  # pragma: no cover
+        return
+    def unapprove_cmd(update, context):  # pragma: no cover
+        return
+    def unapprove_all_cmd(update, context):  # pragma: no cover
+        return
+    def should_moderate(chat_id: int, user_id: int) -> bool:  # pragma: no cover
+        return True
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global in-memory state (still used)
+# ---------- GLOBAL STATE ----------
 pending_appeals = {}
 appeal_attempt_counts = {}
 appeal_approved_counts = {}
 pending_verifications = {}
 
-# ---------- FastAPI + Telegram Application setup ----------
+# ---------- FASTAPI + TELEGRAM APP ----------
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not set in environment (config.py)")
+    raise RuntimeError("BOT_TOKEN missing")
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
 if not WEBHOOK_HOST:
-    raise RuntimeError("WEBHOOK_HOST not set in environment (config.py)")
+    raise RuntimeError("WEBHOOK_HOST missing")
 
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-# Build PTB Application
 application = Application.builder().token(BOT_TOKEN).build()
 app = FastAPI()
 
 
-# ---------- UTILITIES ----------
+# ---------- HELPERS ----------
 async def log_to_logger(text: str, bot):
-    if not LOGGER_CHAT_ID:
-        return
-    try:
-        await bot.send_message(LOGGER_CHAT_ID, text)
-    except Exception:
-        pass
+    if LOGGER_CHAT_ID:
+        try:
+            await bot.send_message(LOGGER_CHAT_ID, text)
+        except Exception:
+            pass
 
 
 async def send_temp_message(chat, text: str, seconds: int = 180, style: str = "normal"):
-    """
-    Keep your styled temporary messages. Uses asyncio.sleep (simple).
-    You can replace calls to auto_delete_job for better scaling.
-    """
-    # formatting
     if style == "warning":
         formatted = f"⚠️ <b>WARNING</b> ⚠️\n\n<blockquote>{text}</blockquote>"
     elif style == "info":
@@ -130,7 +135,6 @@ async def send_temp_message(chat, text: str, seconds: int = 180, style: str = "n
     except Exception:
         msg = await chat.send_message(text)
 
-    # schedule deletion using asyncio (simple). For high scale, consider JobQueue method.
     try:
         await asyncio.sleep(seconds)
         await msg.delete()
@@ -138,9 +142,7 @@ async def send_temp_message(chat, text: str, seconds: int = 180, style: str = "n
         pass
 
 
-# ---------- ADMIN CHECK (wrap to accept update/context like earlier) ----------
 async def _is_admin_from_update(update, context):
-    """Wrapper to match previous usage is_admin(update, context)."""
     try:
         chat = update.effective_chat
         user = update.effective_user
@@ -149,7 +151,7 @@ async def _is_admin_from_update(update, context):
         return False
 
 
-# ---------- START handler (preserve original behavior) ----------
+# ---------- START ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
@@ -157,12 +159,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     add_user(user.id, user.username or user.first_name)
 
-    await log_to_logger(
-        f"🔹 /start used by {user.first_name} (id={user.id}) in chat {chat.id} ({chat.type})",
-        bot,
-    )
+    await log_to_logger(f"🔹 /start used by {user.first_name} (id={user.id}) in chat {chat.id} ({chat.type})", bot)
 
-    # GROUP /start
     if chat.type != "private":
         add_group(chat.id, chat.title, user.id)
         return await update.message.reply_text(
@@ -170,16 +168,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
-    # DM: deep-link verify handler
     if context.args and context.args[0].startswith("verify_"):
         try:
             group_id = int(context.args[0].split("_")[1])
         except Exception:
-            return await update.message.reply_text(
-                "<code>Invalid verify link.</code>", parse_mode=ParseMode.HTML
-            )
+            return await update.message.reply_text("<code>Invalid verify link.</code>", parse_mode=ParseMode.HTML)
 
-        # UNMUTE USER
         try:
             await context.bot.restrict_chat_member(
                 group_id,
@@ -196,7 +190,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
             )
 
-        # DELETE VERIFY BUTTON
         key = (group_id, user.id)
         msg_id = pending_verifications.pop(key, None)
         if msg_id:
@@ -205,29 +198,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        # DM SUCCESS
-        await update.message.reply_text(
-            "✅ <b>Successfully verified!</b>\n\nAb aap group me freely chat kar sakte ho.",
-            parse_mode=ParseMode.HTML,
-        )
+        await update.message.reply_text("✅ <b>Successfully verified!</b>\n\nAb aap group me freely chat kar sakte ho.", parse_mode=ParseMode.HTML)
 
-        # GROUP ANNOUNCEMENT (Styled)
         try:
-            await bot.send_message(
-                group_id,
-                f"✨ <b>{user.first_name} ɪꜱ ᴠᴇʀɪꜰɪᴇᴅ ᴀɴᴅ ᴜɴᴍᴜᴛᴇᴅ! 🍷</b>",
-                parse_mode=ParseMode.HTML,
-            )
+            await bot.send_message(group_id, f"✨ <b>{user.first_name} ɪꜱ ᴠᴇʀɪꜰɪᴇᴅ ᴀɴᴅ ᴜɴᴍᴜᴛᴇᴅ! 🍷</b>", parse_mode=ParseMode.HTML)
         except Exception:
             pass
 
         return
 
-    # Normal DM /start
-    await update.message.reply_text(
-        "👋 <b>Hello I am AI Admin</b>\n\n" "<i>Futures coming soon...</i>",
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text("👋 <b>Hello I am AI Admin</b>\n\n<i>Futures coming soon...</i>", parse_mode=ParseMode.HTML)
 
 
 # ---------- WELCOME NEW MEMBER ----------
@@ -253,7 +233,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         add_user(member.id, member.username or member.first_name)
 
-        # mute user until verify
         try:
             await bot.restrict_chat_member(chat.id, member.id, permissions=ChatPermissions(can_send_messages=False))
         except Exception:
@@ -351,11 +330,9 @@ async def appeal(update, context):
     bot = context.bot
     user_id = user.id
 
-    # Only DM me appeal
     if chat.type != "private":
         return await update.message.reply_text("<code>DM me /appeal bhejo.</code>", parse_mode=ParseMode.HTML)
 
-    # Appeal exist check
     if user_id not in pending_appeals or not pending_appeals[user_id]:
         return await update.message.reply_text("<i>No active ban/mute appeal found.</i>", parse_mode=ParseMode.HTML)
 
@@ -365,11 +342,9 @@ async def appeal(update, context):
 
     group_ids = list(pending_appeals[user_id])
 
-    # Attempt Counter
     attempt_count = appeal_attempt_counts.get(user_id, 0) + 1
     appeal_attempt_counts[user_id] = attempt_count
 
-    # Approved Counter
     approved_count = appeal_approved_counts.get(user_id, 0)
 
     # AI AUTO-HANDLING -- run evaluate_appeal in executor (blocking)
@@ -382,7 +357,6 @@ async def appeal(update, context):
         decision = {"approve": False, "reason": "AI error"}
 
     if approved_count < 3 and decision.get("approve"):
-        # UNBAN + UNMUTE sabhi groups me
         for gid in group_ids:
             log_appeal(user_id, gid, appeal_text, True)
             try:
@@ -412,7 +386,7 @@ async def appeal(update, context):
         appeal_attempt_counts.pop(user_id, None)
         return
 
-    # If AI rejected or limit reached -> admin review
+    # Admin review path...
     primary_gid = group_ids[0]
     try:
         primary_chat = await context.bot.get_chat(primary_gid)
@@ -499,6 +473,17 @@ async def handle_message(update, context):
 
     if user.is_bot:
         return
+
+    # ---------- APPROVAL CHECK: skip approved users ----------
+    try:
+        chat_id = chat.id
+        user_id = user.id if user else None
+        if user_id is not None and not should_moderate(chat_id, user_id):
+            # approved user -> ignore moderation entirely
+            return
+    except Exception:
+        # If approvals check fails, continue to moderation to be safe
+        pass
 
     if await _is_admin_from_update(update, context):
         return
@@ -650,7 +635,8 @@ async def coming_soon(update, context):
         "🚧 <b>Coming Soon:</b>\n\n"
         "<blockquote>"
         "- Advanced analytics dashboard\n"
-        "- Custom punishments per rule\n        - Flood / spam shield\n"
+        "- Custom punishments per rule\n"
+        "- Flood / spam shield\n"
         "- Auto backup & restore"
         "</blockquote>",
         parse_mode=ParseMode.HTML,
@@ -675,6 +661,11 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("appeal", appeal))
     app.add_handler(CommandHandler("soon", coming_soon))
 
+    # Approval commands
+    app.add_handler(CommandHandler("approve", approve_cmd))
+    app.add_handler(CommandHandler("unapprove", unapprove_cmd))
+    app.add_handler(CommandHandler("unapprove_all", unapprove_all_cmd))
+
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye_member))
 
@@ -692,7 +683,6 @@ async def telegram_webhook(req: Request):
         update = Update.de_json(data, application.bot)
     except Exception:
         return Response(status_code=400)
-    # enqueue update quickly
     await application.update_queue.put(update)
     return Response(status_code=200)
 
@@ -705,7 +695,6 @@ async def root():
 # ---------- Startup / Shutdown hooks ----------
 @app.on_event("startup")
 async def startup():
-    # validate config & ensure DB connectivity + indexes
     validate_config(raise_on_missing=True)
     try:
         ensure_connection()
@@ -718,19 +707,15 @@ async def startup():
     except Exception as e:
         logger.warning("ensure_indexes failed: %s", e)
 
-    # initialize application (makes .bot available etc.)
     await application.initialize()
-    # register handlers (application must have been created)
     register_handlers(application)
 
-    # set webhook
     try:
         await application.bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set to %s", WEBHOOK_URL)
     except Exception as e:
         logger.error("Failed to set webhook: %s", e)
 
-    # start a dedicated consumer to process application.update_queue
     async def _process_queue():
         await asyncio.sleep(0.25)
         q = getattr(application, "update_queue", None)
@@ -765,6 +750,5 @@ async def shutdown():
 
 # ---------- For local debugging (not used in production webhook) ----------
 if __name__ == "__main__":
-    # This will not be used when running under Gunicorn + Uvicorn worker.
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
