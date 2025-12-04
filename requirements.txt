@@ -1,0 +1,27 @@
+# --- Telegram Bot Framework (async, webhook-compatible) ---
+python-telegram-bot==21.4
+
+# --- Google Gemini / Generative AI SDK ---
+google-generativeai==0.8.3
+
+# --- Environment loader ---
+python-dotenv==1.0.1
+
+# --- MongoDB driver ---
+pymongo==4.8.0
+
+# --- FastAPI for webhook server ---
+fastapi==0.110.0
+
+# --- ASGI server to run FastAPI ---
+uvicorn==0.29.0
+
+# --- Gunicorn (production process manager for webhook) ---
+gunicorn==21.2.0
+
+# --- Redis + RQ (background job queue for moderation tasks) ---
+redis==5.0.1
+rq==1.15.1
+
+# --- HTTP utils ---
+requests==2.31.0
