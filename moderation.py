@@ -19,6 +19,21 @@ try:
 except Exception:
     enqueue_task = None  # if not present, handler will fallback to run sync in executor
 
+# Approval helper (skip moderation for approved users)
+try:
+    from approvals import should_moderate
+except Exception:
+    # fallback - if approvals module not available, always moderate
+    def should_moderate(chat_id: int, user_id: int) -> bool:
+        return True
+
+# Rules fetcher (so we can pass chat-specific rules to the model)
+try:
+    from models import get_rules_db
+except Exception:
+    def get_rules_db(chat_id: int):
+        return []
+
 # ---------- Lazy model init ----------
 _moderation_model = None
 _appeal_model = None
@@ -116,7 +131,7 @@ MESSAGE:
         )
         data = safe_json(res.text.strip(), default)
         return data
-    except Exception as e:
+    except Exception:
         # best effort return default
         return default
 
@@ -185,30 +200,52 @@ def evaluate_appeal_sync(text: str):
 # ---------- Async handler (used by webhook process) ----------
 async def handle_message(update, context):
     """
-    Async handler to be registered with PTB Application in webhook mode.
+    Async handler to be registered with PTB Application in webhook/polling mode.
     This should *not* perform heavy work; it enqueues a job and returns quickly.
     """
-    # Quick acknowledgement - optional (you can remove to avoid extra messages)
+
+    # Basic guards
+    if not update or not update.message or not update.effective_chat:
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.message
+
+    # Skip moderation for private chats or bots
+    if chat.type == "private" or (user and user.is_bot):
+        return
+
+    chat_id = chat.id
+    user_id = user.id if user else None
+
+    # -------------- NEW: skip approved users --------------
     try:
-        if update.message and update.message.chat:
-            # optional: do a light ack only in private chats or when necessary
-            # await update.message.reply_text("Queued for moderation.")
-            pass
+        if user_id is not None and not should_moderate(chat_id, user_id):
+            # approved user -> ignore moderation
+            return
     except Exception:
+        # if approvals check fails for some reason, fall back to moderating
         pass
+
+    # -------------- fetch chat-specific rules --------------
+    try:
+        rules = get_rules_db(chat_id) if 'get_rules_db' in globals() else []
+        rules_text = "\n".join(rules) if rules else ""
+    except Exception:
+        rules_text = ""
 
     # Enqueue for background processing
     try:
         if enqueue_task:
-            # enqueue process_message_sync in the worker; pass update as serializable dict
-            job = enqueue_task("moderation.process_message_sync", update.to_dict())
+            # enqueue process_message_sync in the worker; pass update as serializable dict and rules_text
+            job = enqueue_task("moderation.process_message_sync", update.to_dict(), rules_text)
             # optionally store job.id/log it
-            # print("Enqueued moderation job:", getattr(job, "id", None))
         else:
             # fallback: if enqueue helper is not available, run processing in thread pool (not recommended)
             import asyncio
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, process_message_sync, update.to_dict(), "")
+            await loop.run_in_executor(None, process_message_sync, update.to_dict(), rules_text)
     except Exception as e:
         # enqueue failing shouldn't crash handler
         print("Failed to enqueue moderation job:", e)
