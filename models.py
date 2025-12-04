@@ -1,7 +1,7 @@
 # models.py
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from pymongo import ASCENDING, IndexModel
+from pymongo import ASCENDING, IndexModel, ReturnDocument
 from pymongo.collection import Collection
 from db import db
 
@@ -121,6 +121,63 @@ def log_action(chat_id: int, user_id: int, action: str, reason: str) -> None:
     })
 
 
+# ---------- Approvals (new) ----------
+def approve_user_db(chat_id: int, user_id: int, approver_id: int) -> None:
+    """
+    Mark a user as approved in a chat (upsert).
+    """
+    db.approved_users.update_one(
+        {"chat_id": chat_id, "user_id": user_id},
+        {
+            "$set": {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "approved_by": approver_id,
+                "approved_at": datetime.utcnow()
+            }
+        },
+        upsert=True
+    )
+
+
+def unapprove_user_db(chat_id: int, user_id: int) -> None:
+    """
+    Remove a single user's approval in a chat.
+    """
+    db.approved_users.delete_one({"chat_id": chat_id, "user_id": user_id})
+
+
+def is_user_approved_db(chat_id: int, user_id: int) -> bool:
+    """
+    Returns True if the user is approved in the given chat.
+    """
+    doc = db.approved_users.find_one({"chat_id": chat_id, "user_id": user_id}, {"_id": 0})
+    return bool(doc)
+
+
+def unapprove_all_db(chat_id: int) -> int:
+    """
+    Remove all approvals for a chat. Returns the number removed.
+    """
+    res = db.approved_users.delete_many({"chat_id": chat_id})
+    return res.deleted_count if res else 0
+
+
+def count_approved_db(chat_id: int) -> int:
+    """
+    Return the total number of approved users in a chat.
+    """
+    return db.approved_users.count_documents({"chat_id": chat_id})
+
+
+def get_approved_users_db(chat_id: int) -> List[int]:
+    """
+    Return list of user_ids approved in the chat.
+    """
+    docs = db.approved_users.find({"chat_id": chat_id}, {"user_id": 1, "_id": 0})
+    return [d["user_id"] for d in docs]
+
+
 # ---------- Indexes (call at startup) ----------
 def ensure_indexes() -> None:
     """
@@ -173,6 +230,15 @@ def ensure_indexes() -> None:
         db.moderation_logs.create_indexes([
             IndexModel([("chat_id", ASCENDING)], name="idx_modlogs_chat"),
             IndexModel([("user_id", ASCENDING)], name="idx_modlogs_user")
+        ])
+    except Exception:
+        pass
+
+    # approved_users: ensure fast lookup per chat+user, unique constraint
+    try:
+        db.approved_users.create_indexes([
+            IndexModel([("chat_id", ASCENDING), ("user_id", ASCENDING)], name="idx_approved_chat_user", unique=True),
+            IndexModel([("chat_id", ASCENDING)], name="idx_approved_chat")
         ])
     except Exception:
         pass
