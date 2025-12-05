@@ -88,9 +88,6 @@ appeal_attempt_counts = {}
 appeal_approved_counts = {}
 pending_verifications = {}
 
-# Cache bot username for deep links (populated on startup)
-BOT_USERNAME = None
-
 # ---------- FASTAPI + TELEGRAM APP ----------
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
@@ -171,7 +168,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
-    # verify deep-link (existing)
     if context.args and context.args[0].startswith("verify_"):
         try:
             group_id = int(context.args[0].split("_")[1])
@@ -209,25 +205,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        return
-
-    # handle appeal deep-link: appeal_<groupid>_<userid> or appeal_<groupid>
-    if context.args and context.args[0].startswith("appeal_"):
-        try:
-            parts = context.args[0].split("_", 2)
-            group_id = int(parts[1])
-            target_user_id = int(parts[2]) if len(parts) > 2 else user.id
-        except Exception:
-            return await update.message.reply_text("<code>Invalid appeal link.</code>", parse_mode=ParseMode.HTML)
-
-        # Inform user how to appeal (private DM)
-        await update.message.reply_text(
-            f"📝 <b>Appeal for group:</b> <code>{group_id}</code>\n\n"
-            "Please send:\n"
-            "<code>/appeal &lt;reason&gt;</code>\n\n"
-            "Example: /appeal I misunderstood and apologise.",
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     await update.message.reply_text("👋 <b>Hello I am AI Admin</b>\n\n<i>Futures coming soon...</i>", parse_mode=ParseMode.HTML)
@@ -387,17 +364,7 @@ async def appeal(update, context):
             except Exception:
                 pass
             try:
-                # Explicitly restore send permissions (unmute)
-                await context.bot.restrict_chat_member(
-                    gid,
-                    user_id,
-                    permissions=ChatPermissions(
-                        can_send_messages=True,
-                        can_send_media_messages=True,
-                        can_send_other_messages=True,
-                        can_add_web_page_previews=True,
-                    ),
-                )
+                await context.bot.restrict_chat_member(gid, user_id, permissions=ChatPermissions())
             except Exception:
                 pass
 
@@ -476,19 +443,6 @@ async def approve_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for gid in group_ids:
         try:
             await context.bot.unban_chat_member(gid, user_id)
-        except Exception:
-            pass
-        try:
-            await context.bot.restrict_chat_member(
-                gid,
-                user_id,
-                permissions=ChatPermissions(
-                    can_send_messages=True,
-                    can_send_media_messages=True,
-                    can_send_other_messages=True,
-                    can_add_web_page_previews=True,
-                ),
-            )
         except Exception:
             pass
 
@@ -588,15 +542,9 @@ async def handle_message(update, context):
     if action == "mute":
         until = datetime.utcnow() + timedelta(minutes=MUTE_DURATION_MIN)
         try:
-            # restrict/mute the user
             await chat.restrict_member(user.id, ChatPermissions(can_send_messages=False), until_date=until)
         except Exception:
             pass
-
-        # Track pending appeal for mute so /appeal works via DM
-        if user_id not in pending_appeals:
-            pending_appeals[user_id] = set()
-        pending_appeals[user_id].add(chat_id)
 
         mute_html = f"""
 🔇 <b>USER MUTED</b> 🔇
@@ -605,47 +553,18 @@ async def handle_message(update, context):
 
 <b>Duration:</b> {MUTE_DURATION_MIN} minutes
         """
+        asyncio.create_task(send_temp_message(chat, mute_html, seconds=180, style="error"))
 
-        # try to present group notice with inline appeal button (and fallback)
         try:
-            # prepare buttons: callback (preferred) + deep link fallback
-            buttons = []
-            buttons.append(InlineKeyboardButton("📝 Appeal to Unmute", callback_data=f"appeal_dm:{user_id}:{chat_id}"))
-            if BOT_USERNAME:
-                deep = f"https://t.me/{BOT_USERNAME}?start=appeal_{chat_id}_{user_id}"
-                buttons.append(InlineKeyboardButton("➡ Open Bot to Appeal", url=deep))
-
-            await context.bot.send_message(
-                chat.id,
-                mute_html,
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([buttons]) if buttons else None,
+            await bot.send_message(user.id,
+                f"🔇 <b>You were muted in '{chat.title}'</b>\n\n"
+                f"<b>Duration:</b> {MUTE_DURATION_MIN} minutes\n"
+                f"<b>Reason:</b> <code>{reason}</code>\n\n"
+                f"<i>Agar aapko lagta hai galti se hua, to /appeal &lt;reason&gt; bhejo.</i>",
+                parse_mode=ParseMode.HTML
             )
         except Exception:
-            # fallback to temp message
-            asyncio.create_task(send_temp_message(chat, mute_html, seconds=180, style="error"))
-
-        # try to DM the user immediately as well (best-effort)
-        try:
-            appeal_instruction = "DM me /appeal <reason> to request review."
-            if BOT_USERNAME:
-                appeal_instruction += f" (Or open: https://t.me/{BOT_USERNAME})"
-
-            dm_text = (
-                f"🔇 <b>Aapko mute kiya gaya hai</b>\n\n"
-                f"<b>Group:</b> {chat.title}\n"
-                f"<b>Reason:</b> <code>{reason}</code>\n"
-                f"<b>Duration:</b> {MUTE_DURATION_MIN} minutes\n\n"
-                f"{appeal_instruction}\n\n"
-                f"<i>Agar aapko lagta hai galti se hua, to /appeal &lt;reason&gt; bhejo.</i>"
-            )
-            await bot.send_message(user.id, dm_text, parse_mode=ParseMode.HTML)
-        except Exception:
-            # DM may fail due to privacy/block — ignore
-            try:
-                await log_to_logger(f"Failed to DM muted user {user_id} in {chat_id}", bot)
-            except Exception:
-                pass
+            pass
         return
 
     # BAN (temporary / immediate)
@@ -676,10 +595,7 @@ async def handle_message(update, context):
                 parse_mode=ParseMode.HTML
             )
         except Exception:
-            try:
-                await log_to_logger(f"Failed to DM banned user {user_id} in {chat_id}", bot)
-            except Exception:
-                pass
+            pass
 
         reset_warnings(chat_id, user_id)
         return
@@ -711,69 +627,6 @@ async def goodbye_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     goodbye_msg = random.choice(goodbye_messages)
     asyncio.create_task(send_temp_message(chat, goodbye_msg, seconds=120, style="goodbye"))
-
-
-
-# ---------- APPEAL BUTTON CALLBACK (for "Appeal to Unmute" inline button) ----------
-async def appeal_button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()  # acknowledge press
-
-    bot = context.bot
-    try:
-        # callback_data format: "appeal_dm:<target_user_id>:<chat_id>"
-        _, target_user_str, gid_str = query.data.split(":")
-        target_user_id = int(target_user_str)
-        gid = int(gid_str)
-    except Exception:
-        try:
-            await query.edit_message_text("<code>Invalid appeal data.</code>", parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        return
-
-    pressing_user = query.from_user
-    # only the muted user may press this callback to request DM
-    if pressing_user.id != target_user_id:
-        try:
-            await query.answer("This button is for the muted user only.", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    # Try to send DM with appeal instructions
-    try:
-        try:
-            gchat = await bot.get_chat(gid)
-            chat_title = gchat.title or str(gid)
-        except Exception:
-            chat_title = str(gid)
-
-        dm_text = (
-            f"🔇 <b>Appeal for mute in</b> <b>{chat_title}</b>\n\n"
-            "Aap is group me mute ho gaye ho. Please explain below why you should be unmuted.\n\n"
-            "<b>Usage:</b> <code>/appeal &lt;reason&gt;</code>\n\n"
-            "Example: <code>/appeal I misunderstood the rule, will not repeat</code>\n\n"
-        )
-        if BOT_USERNAME:
-            dm_text += f"<i>If /appeal doesn't work, open: https://t.me/{BOT_USERNAME}</i>"
-
-        await bot.send_message(pressing_user.id, dm_text, parse_mode=ParseMode.HTML)
-
-        # confirm in-group inline message
-        try:
-            await query.edit_message_text("✅ DM sent — please check your messages and send `/appeal <reason>`.")
-        except Exception:
-            pass
-    except Exception:
-        # DM failed — give fallback alert with deep-link
-        try:
-            fallback = "⚠️ Unable to DM you. Please open the bot and send `/appeal <reason>`."
-            if BOT_USERNAME:
-                fallback += f" https://t.me/{BOT_USERNAME}"
-            await query.answer(fallback, show_alert=True)
-        except Exception:
-            pass
 
 
 # ---------- COMING SOON ----------
@@ -817,7 +670,6 @@ def register_handlers(app: Application):
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye_member))
 
     app.add_handler(CallbackQueryHandler(approve_user, pattern=r"^approve:"))
-    app.add_handler(CallbackQueryHandler(appeal_button_cb, pattern=r"^appeal_dm:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.add_error_handler(error_handler)
@@ -857,15 +709,6 @@ async def startup():
 
     await application.initialize()
     register_handlers(application)
-
-    # cache bot username for deep links
-    try:
-        me = await application.bot.get_me()
-        global BOT_USERNAME
-        BOT_USERNAME = getattr(me, "username", None)
-        logger.info("Cached bot username: %s", BOT_USERNAME)
-    except Exception as e:
-        logger.warning("Failed to cache bot username: %s", e)
 
     try:
         await application.bot.set_webhook(WEBHOOK_URL)
